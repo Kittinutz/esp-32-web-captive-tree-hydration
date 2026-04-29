@@ -1,6 +1,7 @@
 #include "config/config_manager.h"
 #include "wifi/wifi_manager.h"
 #include "web/web_server.h"
+#include "web/captive_portal.h"
 #include "mqtt/mqtt_manager.h"
 #include "pid/pid_controller.h"
 #include "sensors/moisture_sensor.h"
@@ -42,8 +43,9 @@ void app_main(void) {
     if (!configured) {
         ESP_LOGI(TAG, "No valid config – starting setup mode");
         wifi_start_ap("Onnion-Setup", NULL);   /* open AP, no password */
+        captive_portal_dns_start();            /* hijack DNS → auto popup */
         web_server_start_setup();
-        ESP_LOGI(TAG, "Connect phone to 'Onnion-Setup' WiFi, open http://192.168.4.1");
+        ESP_LOGI(TAG, "Connect phone to 'Onnion-Setup' WiFi – setup page pops up automatically");
 
         /* Block here; the web handler will save config and call esp_restart(). */
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));

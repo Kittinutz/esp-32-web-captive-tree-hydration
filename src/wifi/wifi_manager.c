@@ -8,6 +8,7 @@
 #include "freertos/event_groups.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #define TAG              "wifi"
 #define CONNECTED_BIT    BIT0
@@ -47,7 +48,11 @@ void wifi_start_ap(const char *ssid, const char *password) {
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    /* Force RAM storage so NVS-cached config (default "ESP_XXXXXX") does not
+       override the SSID we set below. */
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     wifi_config_t ap_cfg = {
         .ap = {
@@ -61,9 +66,9 @@ void wifi_start_ap(const char *ssid, const char *password) {
         strncpy((char *)ap_cfg.ap.password, password, sizeof(ap_cfg.ap.password) - 1);
     }
 
-    esp_wifi_set_mode(WIFI_MODE_AP);
-    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "AP started  SSID=%s  IP=192.168.4.1", ssid);
 }
@@ -72,7 +77,8 @@ bool wifi_start_sta(const char *ssid, const char *password, int timeout_sec) {
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     esp_event_handler_instance_t h_any, h_ip;
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
@@ -106,4 +112,57 @@ bool wifi_start_sta(const char *ssid, const char *password, int timeout_sec) {
 
 bool wifi_is_connected(void) {
     return (xEventGroupGetBits(s_event_group) & CONNECTED_BIT) != 0;
+}
+
+esp_err_t wifi_scan_ap(char ssids[][33], uint16_t *count, uint16_t max_count) {
+    *count = 0;
+
+    /* Scanning requires STA interface + APSTA mode. */
+    static bool s_sta_netif_created = false;
+    if (!s_sta_netif_created) {
+        esp_netif_create_default_wifi_sta();
+        s_sta_netif_created = true;
+    }
+
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (esp_wifi_scan_start(NULL, true) != ESP_OK) {
+        esp_wifi_set_mode(WIFI_MODE_AP);
+        return ESP_FAIL;
+    }
+
+    uint16_t ap_num = 0;
+    esp_wifi_scan_get_ap_num(&ap_num);
+    if (ap_num == 0) {
+        esp_wifi_set_mode(WIFI_MODE_AP);
+        return ESP_OK;
+    }
+
+    uint16_t fetch = ap_num < max_count ? ap_num : max_count;
+    wifi_ap_record_t *recs = malloc(sizeof(wifi_ap_record_t) * fetch);
+    if (!recs) {
+        esp_wifi_set_mode(WIFI_MODE_AP);
+        return ESP_ERR_NO_MEM;
+    }
+    esp_wifi_scan_get_ap_records(&fetch, recs);
+
+    /* Deduplicate and skip hidden SSIDs. */
+    uint16_t unique = 0;
+    for (uint16_t i = 0; i < fetch && unique < max_count; i++) {
+        if (recs[i].ssid[0] == '\0') continue;
+        bool dup = false;
+        for (uint16_t j = 0; j < unique; j++) {
+            if (strcmp(ssids[j], (char *)recs[i].ssid) == 0) { dup = true; break; }
+        }
+        if (!dup) {
+            strncpy(ssids[unique], (char *)recs[i].ssid, 32);
+            ssids[unique][32] = '\0';
+            unique++;
+        }
+    }
+    *count = unique;
+
+    free(recs);
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    ESP_LOGI(TAG, "Scan done: %d network(s) found", unique);
+    return ESP_OK;
 }

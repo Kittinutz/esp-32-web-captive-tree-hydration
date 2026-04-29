@@ -1,6 +1,8 @@
 #include "web/web_server.h"
 
 #include "config/config_manager.h"
+#include "wifi/wifi_manager.h"
+#include "actuators/motor_controller.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -90,15 +92,19 @@ static const char SETUP_HTML[] =
     "max-width:440px;box-shadow:0 4px 16px rgba(0,0,0,.12)}"
     "h1{color:#2e7d32;margin-bottom:24px;font-size:1.4rem}"
     "label{display:block;margin-top:14px;font-size:.85rem;font-weight:600;color:#444}"
-    "input{display:block;width:100%;padding:10px 12px;margin-top:5px;"
-    "border:1px solid #ccc;border-radius:6px;font-size:1rem}"
-    "input:focus{outline:none;border-color:#43a047;"
+    "input,select{display:block;width:100%;padding:10px 12px;margin-top:5px;"
+    "border:1px solid #ccc;border-radius:6px;font-size:1rem;background:#fff}"
+    "input:focus,select:focus{outline:none;border-color:#43a047;"
     "box-shadow:0 0 0 2px rgba(67,160,71,.25)}"
-    ".hint{font-size:.75rem;color:#999;margin-top:3px}"
-    "button{display:block;width:100%;padding:13px;margin-top:24px;"
+    ".hint{font-size:.75rem;color:#888;margin-top:4px}"
+    "button[type=submit]{display:block;width:100%;padding:13px;margin-top:24px;"
     "background:#43a047;color:#fff;border:none;border-radius:6px;"
     "font-size:1rem;font-weight:600;cursor:pointer}"
-    "button:hover{background:#2e7d32}"
+    "button[type=submit]:hover{background:#2e7d32}"
+    ".btn-scan{display:block;width:100%;padding:8px;margin-top:6px;"
+    "background:#607d8b;color:#fff;border:none;border-radius:6px;"
+    "font-size:.85rem;cursor:pointer}"
+    ".btn-scan:hover{background:#455a64}"
     "</style></head>"
     "<body><div class=\"card\">"
     "<h1>Onnion Device Setup</h1>"
@@ -106,9 +112,14 @@ static const char SETUP_HTML[] =
     "<label>Device Name</label>"
     "<input type=\"text\" name=\"device_name\" placeholder=\"my-plant\""
     " maxlength=\"63\" required>"
-    "<label>WiFi SSID</label>"
-    "<input type=\"text\" name=\"wifi_ssid\" placeholder=\"Home WiFi\""
-    " maxlength=\"63\" required>"
+    "<label>WiFi Network</label>"
+    "<select id=\"ssid_sel\"><option>Scanning...</option></select>"
+    "<p class=\"hint\" id=\"scan_hint\">Scanning for networks...</p>"
+    "<button type=\"button\" class=\"btn-scan\" onclick=\"doScan()\">"
+    "&#8635; Rescan</button>"
+    "<input type=\"text\" name=\"wifi_ssid\" id=\"ssid_txt\""
+    " placeholder=\"or type SSID manually\" maxlength=\"63\" required"
+    " style=\"margin-top:8px\">"
     "<label>WiFi Password</label>"
     "<input type=\"password\" name=\"wifi_pass\" placeholder=\"(leave blank if open)\""
     " maxlength=\"63\">"
@@ -120,7 +131,33 @@ static const char SETUP_HTML[] =
     "<input type=\"number\" name=\"setpoint\" value=\"60\" min=\"0\" max=\"100\">"
     "<p class=\"hint\">Target soil moisture (PID setpoint)</p>"
     "<button type=\"submit\">Save &amp; Connect</button>"
-    "</form></div></body></html>";
+    "</form>"
+    "<script>"
+    "var sel=document.getElementById('ssid_sel'),"
+    "txt=document.getElementById('ssid_txt');"
+    "sel.onchange=function(){txt.value=this.value;};"
+    "function doScan(){"
+    "sel.innerHTML='<option>Scanning...</option>';"
+    "txt.value='';"
+    "document.getElementById('scan_hint').textContent='Scanning...';"
+    "fetch('/scan').then(function(r){return r.json();})"
+    ".then(function(d){"
+    "sel.innerHTML='';"
+    "if(!d.ssids||!d.ssids.length){"
+    "sel.innerHTML='<option>No networks found</option>';"
+    "document.getElementById('scan_hint').textContent='None found – type SSID below.';"
+    "return;}"
+    "d.ssids.forEach(function(s){"
+    "var o=document.createElement('option');o.value=s;o.textContent=s;"
+    "sel.appendChild(o);});"
+    "txt.value=sel.value;"
+    "document.getElementById('scan_hint').textContent=d.ssids.length+' network(s) found';"
+    "}).catch(function(){"
+    "document.getElementById('scan_hint').textContent='Scan failed – type SSID below.';});"
+    "}"
+    "doScan();"
+    "</script>"
+    "</div></body></html>";
 
 static const char SAVED_HTML[] =
     "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
@@ -148,13 +185,12 @@ static void build_control_page(char *buf, size_t buf_len) {
     name[sizeof(name) - 1] = '\0';
     xSemaphoreGive(s_mutex);
 
-    const char *motor_str  = motor_on ? "ON"       : "OFF";
-    const char *mode_str   = manual   ? "Manual"   : "Auto (PID)";
-    const char *next_state = motor_on ? "0"        : "1";
-    const char *btn_class  = motor_on ? "btn-red"  : "btn-green";
-    const char *btn_label  = motor_on ? "Turn OFF" : "Turn ON";
+    const char *motor_str = motor_on ? "ON"       : "OFF";
+    const char *mode_str  = manual   ? "Manual"   : "Auto (PID)";
+    const char *btn_class = motor_on ? "btn-red"  : "btn-green";
+    const char *btn_label = motor_on ? "Turn OFF" : "Turn ON";
 
-    /* Format specifiers in order: %s %s %.1f %s %s %s %s %s
+    /* Format specifiers in order: %s %s %.1f %s %s %s %s
        The %% sequences inside CSS produce a literal % in the output. */
     snprintf(buf, buf_len,
         "<!DOCTYPE html>"
@@ -191,10 +227,8 @@ static void build_control_page(char *buf, size_t buf_len) {
         "<h2>Motor (GPIO 4)</h2>"
         "<div class=\"value\">%s</div>"
         "<div class=\"meta\">Mode: %s</div>"
-        "<form method=\"POST\" action=\"/motor\" style=\"margin-top:14px\">"
-        "<input type=\"hidden\" name=\"state\" value=\"%s\">"
-        "<button class=\"btn %s\" type=\"submit\">%s</button>"
-        "</form>"
+        "<button id=\"mbtn\" class=\"btn %s\" onclick=\"toggleMotor()\""
+        " style=\"margin-top:14px\">%s</button>"
         "<a class=\"btn btn-gray\" href=\"/auto\""
         " style=\"margin-top:8px;padding:11px;display:block\">"
         "Return to Auto (PID)</a>"
@@ -204,16 +238,70 @@ static void build_control_page(char *buf, size_t buf_len) {
         "<button class=\"btn btn-gray\" type=\"submit\">Reset to Setup</button>"
         "</form>"
         "</div>"
+        "<script>"
+        "function toggleMotor(){"
+        "var b=document.getElementById('mbtn');"
+        "b.disabled=true;"
+        "fetch('/motor',{method:'POST'})"
+        ".then(function(r){return r.json();})"
+        ".then(function(d){"
+        "b.className='btn '+(d.on?'btn-red':'btn-green');"
+        "b.textContent=d.on?'Turn OFF':'Turn ON';"
+        "b.disabled=false;})"
+        ".catch(function(){b.disabled=false;});}"
+        "</script>"
         "</body></html>",
-        name,        /* title    */
-        name,        /* h1       */
-        moisture,    /* %.1f%%   */
-        motor_str,   /* value    */
-        mode_str,    /* meta     */
-        next_state,  /* hidden   */
-        btn_class,   /* class    */
-        btn_label    /* label    */
+        name,        /* title   */
+        name,        /* h1      */
+        moisture,    /* %.1f%%  */
+        motor_str,   /* value   */
+        mode_str,    /* meta    */
+        btn_class,   /* class   */
+        btn_label    /* label   */
     );
+}
+
+/* ---------- WiFi scan handler (setup mode only) ---------- */
+
+static void json_escape(const char *src, char *dst, size_t dst_len) {
+    size_t di = 0;
+    for (size_t i = 0; src[i] && di + 2 < dst_len; i++) {
+        if (src[i] == '"' || src[i] == '\\') dst[di++] = '\\';
+        dst[di++] = src[i];
+    }
+    dst[di] = '\0';
+}
+
+static esp_err_t h_scan_get(httpd_req_t *req) {
+    char ssids[WIFI_SCAN_MAX][33];
+    uint16_t count = 0;
+    wifi_scan_ap(ssids, &count, WIFI_SCAN_MAX);
+
+    char buf[768];
+    int pos = snprintf(buf, sizeof(buf), "{\"ssids\":[");
+    for (uint16_t i = 0; i < count && pos < (int)sizeof(buf) - 70; i++) {
+        char esc[66];
+        json_escape(ssids[i], esc, sizeof(esc));
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s\"%s\"", i > 0 ? "," : "", esc);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, pos);
+    return ESP_OK;
+}
+
+/* ---------- captive-portal redirect (setup mode only) ---------- */
+
+/* Any URL not registered (Android /generate_204, Apple /hotspot-detect.html,
+   Windows /ncsi.txt, etc.) gets a 302 back to the setup page.
+   This triggers the "Sign in to network" popup on every major OS. */
+static esp_err_t h_captive_404(httpd_req_t *req, httpd_err_code_t err) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
 }
 
 /* ---------- setup handlers ---------- */
@@ -272,21 +360,14 @@ static esp_err_t h_control_get(httpd_req_t *req) {
 }
 
 static esp_err_t h_motor_post(httpd_req_t *req) {
-    char body[64];
-    if (read_body(req, body, sizeof(body)) != ESP_OK) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    /* Toggle: flip current motor state and lock into manual mode. */
+    bool new_on = !motor_is_on();
+    if (s_motor_cb) s_motor_cb(new_on, true);
 
-    char state_str[4] = "0";
-    form_field(body, "state", state_str, sizeof(state_str));
-    bool on = (state_str[0] == '1');
-
-    if (s_motor_cb) s_motor_cb(on, true);
-
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
-    httpd_resp_send(req, NULL, 0);
+    char resp[32];
+    snprintf(resp, sizeof(resp), "{\"on\":%s}", motor_is_on() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -325,12 +406,16 @@ void web_server_start_setup(void) {
     }
 
     const httpd_uri_t routes[] = {
-        {.uri = "/",     .method = HTTP_GET,  .handler = h_setup_get},
-        {.uri = "/save", .method = HTTP_POST, .handler = h_setup_save},
+        {.uri = "/",      .method = HTTP_GET,  .handler = h_setup_get},
+        {.uri = "/save",  .method = HTTP_POST, .handler = h_setup_save},
+        {.uri = "/scan",  .method = HTTP_GET,  .handler = h_scan_get},
     };
-    for (int i = 0; i < 2; i++) httpd_register_uri_handler(s_server, &routes[i]);
+    for (int i = 0; i < 3; i++) httpd_register_uri_handler(s_server, &routes[i]);
 
-    ESP_LOGI(TAG, "Setup server ready at http://192.168.4.1");
+    /* Redirect every unrecognised URL (OS captive-portal probes) to setup page. */
+    httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, h_captive_404);
+
+    ESP_LOGI(TAG, "Setup server + captive portal ready at http://192.168.4.1");
 }
 
 void web_server_start_control(const char *device_name, motor_ctrl_cb_t motor_cb) {
