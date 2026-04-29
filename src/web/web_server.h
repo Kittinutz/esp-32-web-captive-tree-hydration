@@ -13,3 +13,6 @@ void web_server_stop(void);
 
 /* Called by the main loop each sensor cycle to refresh the displayed status. */
 void web_server_update_status(float moisture_pct, bool motor_on, bool motor_manual);
+
+/* Called whenever MQTT connection state changes. url may be NULL to leave unchanged. */
+void web_server_update_mqtt_status(bool connected, const char *url);

@@ -26,7 +26,9 @@ static struct {
     float moisture_pct;
     bool  motor_on;
     bool  motor_manual;
+    bool  mqtt_connected;
     char  device_name[DEVICE_NAME_MAX_LEN];
+    char  mqtt_url[MQTT_URL_MAX_LEN];
 } s_status;
 
 /* ---------- helpers ---------- */
@@ -125,7 +127,7 @@ static const char SETUP_HTML[] =
     " maxlength=\"63\">"
     "<label>MQTT Broker URL</label>"
     "<input type=\"text\" name=\"mqtt_url\""
-    " placeholder=\"mqtt://broker.example.com:1883\" maxlength=\"255\" required>"
+    " placeholder=\"mqtt://broker.example.com:1883 (optional)\" maxlength=\"255\">"
     "<p class=\"hint\">Use mqtt:// for plain, mqtts:// for TLS</p>"
     "<label>Moisture Setpoint (%)</label>"
     "<input type=\"number\" name=\"setpoint\" value=\"60\" min=\"0\" max=\"100\">"
@@ -177,21 +179,28 @@ static const char SAVED_HTML[] =
 
 static void build_control_page(char *buf, size_t buf_len) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    float moisture  = s_status.moisture_pct;
-    bool  motor_on  = s_status.motor_on;
-    bool  manual    = s_status.motor_manual;
+    float moisture   = s_status.moisture_pct;
+    bool  motor_on   = s_status.motor_on;
+    bool  manual     = s_status.motor_manual;
+    bool  mqtt_conn  = s_status.mqtt_connected;
     char  name[DEVICE_NAME_MAX_LEN];
-    strncpy(name, s_status.device_name, sizeof(name) - 1);
+    char  mqtt_url[MQTT_URL_MAX_LEN];
+    strncpy(name,     s_status.device_name, sizeof(name) - 1);
     name[sizeof(name) - 1] = '\0';
+    strncpy(mqtt_url, s_status.mqtt_url,    sizeof(mqtt_url) - 1);
+    mqtt_url[sizeof(mqtt_url) - 1] = '\0';
     xSemaphoreGive(s_mutex);
 
-    const char *motor_str = motor_on ? "ON"       : "OFF";
-    const char *mode_str  = manual   ? "Manual"   : "Auto (PID)";
-    const char *btn_class = motor_on ? "btn-red"  : "btn-green";
-    const char *btn_label = motor_on ? "Turn OFF" : "Turn ON";
+    const char *motor_str   = motor_on  ? "ON"           : "OFF";
+    const char *mode_str    = manual    ? "Manual"       : "Auto (PID)";
+    const char *btn_class   = motor_on  ? "btn-red"      : "btn-green";
+    const char *btn_label   = motor_on  ? "Turn OFF"     : "Turn ON";
+    const char *dot_class   = mqtt_conn ? "dot-green"    : "dot-red";
+    const char *mqtt_status = mqtt_conn ? "Connected"    : "Disconnected";
 
-    /* Format specifiers in order: %s %s %.1f %s %s %s %s
-       The %% sequences inside CSS produce a literal % in the output. */
+    /* Format specifiers: %s(title) %s(h1) %.1f%%(moisture) %s(motor) %s(mode)
+       %s(btn_class) %s(btn_label) %s(dot_class) %s(mqtt_status) %s(mqtt_url)
+       %% inside CSS produces a literal % in the output. */
     snprintf(buf, buf_len,
         "<!DOCTYPE html>"
         "<html lang=\"en\">"
@@ -215,6 +224,13 @@ static void build_control_page(char *buf, size_t buf_len) {
         ".btn-green{background:#43a047;color:#fff}"
         ".btn-red{background:#e53935;color:#fff}"
         ".btn-gray{background:#9e9e9e;color:#fff}"
+        ".dot{display:inline-block;width:10px;height:10px;border-radius:50%%;margin-right:6px}"
+        ".dot-green{background:#43a047}"
+        ".dot-red{background:#e53935}"
+        ".mqtt-st{font-size:1rem;font-weight:600;color:#444;margin-bottom:12px}"
+        "input[type=text]{display:block;width:100%%;padding:10px 12px;"
+        "border:1px solid #ccc;border-radius:6px;font-size:.9rem}"
+        "input[type=text]:focus{outline:none;border-color:#43a047}"
         "</style></head>"
         "<body>"
         "<h1>%s</h1>"
@@ -234,6 +250,16 @@ static void build_control_page(char *buf, size_t buf_len) {
         "Return to Auto (PID)</a>"
         "</div>"
         "<div class=\"card\">"
+        "<h2>MQTT Broker</h2>"
+        "<div class=\"mqtt-st\"><span class=\"dot %s\"></span>%s</div>"
+        "<form method=\"POST\" action=\"/mqtt\">"
+        "<input type=\"text\" name=\"mqtt_url\" value=\"%s\""
+        " placeholder=\"mqtt://broker.example.com:1883\">"
+        "<button class=\"btn btn-gray\" type=\"submit\""
+        " style=\"margin-top:8px\">Update &amp; Restart</button>"
+        "</form>"
+        "</div>"
+        "<div class=\"card\">"
         "<form method=\"POST\" action=\"/reset\">"
         "<button class=\"btn btn-gray\" type=\"submit\">Reset to Setup</button>"
         "</form>"
@@ -251,13 +277,16 @@ static void build_control_page(char *buf, size_t buf_len) {
         ".catch(function(){b.disabled=false;});}"
         "</script>"
         "</body></html>",
-        name,        /* title   */
-        name,        /* h1      */
-        moisture,    /* %.1f%%  */
-        motor_str,   /* value   */
-        mode_str,    /* meta    */
-        btn_class,   /* class   */
-        btn_label    /* label   */
+        name,        /* title      */
+        name,        /* h1         */
+        moisture,    /* %.1f%%     */
+        motor_str,   /* motor val  */
+        mode_str,    /* mode meta  */
+        btn_class,   /* btn class  */
+        btn_label,   /* btn label  */
+        dot_class,   /* dot class  */
+        mqtt_status, /* status txt */
+        mqtt_url     /* url value  */
     );
 }
 
@@ -322,13 +351,13 @@ static esp_err_t h_setup_save(httpd_req_t *req) {
     device_config_t cfg = {0};
 
     if (!form_field(body, "device_name", cfg.device_name, sizeof(cfg.device_name)) ||
-        !form_field(body, "wifi_ssid",   cfg.wifi_ssid,   sizeof(cfg.wifi_ssid))   ||
-        !form_field(body, "mqtt_url",    cfg.mqtt_url,    sizeof(cfg.mqtt_url))) {
+        !form_field(body, "wifi_ssid",   cfg.wifi_ssid,   sizeof(cfg.wifi_ssid))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing required fields");
         return ESP_FAIL;
     }
 
     form_field(body, "wifi_pass", cfg.wifi_password, sizeof(cfg.wifi_password));
+    form_field(body, "mqtt_url",  cfg.mqtt_url,      sizeof(cfg.mqtt_url));
 
     char sp[8] = "60";
     form_field(body, "setpoint", sp, sizeof(sp));
@@ -392,6 +421,32 @@ static esp_err_t h_reset_post(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t h_mqtt_post(httpd_req_t *req) {
+    char body[POST_BODY_MAX];
+    if (read_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char new_url[MQTT_URL_MAX_LEN] = {0};
+    form_field(body, "mqtt_url", new_url, sizeof(new_url));
+
+    device_config_t cfg = {0};
+    config_load(&cfg);
+    strncpy(cfg.mqtt_url, new_url, sizeof(cfg.mqtt_url) - 1);
+    cfg.mqtt_url[sizeof(cfg.mqtt_url) - 1] = '\0';
+    config_save(&cfg);
+
+    static const char msg[] =
+        "<html><body><p>MQTT URL updated. Device restarting...</p></body></html>";
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
+
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+    return ESP_OK;
+}
+
 /* ---------- public API ---------- */
 
 void web_server_start_setup(void) {
@@ -440,8 +495,9 @@ void web_server_start_control(const char *device_name, motor_ctrl_cb_t motor_cb)
         {.uri = "/motor", .method = HTTP_POST, .handler = h_motor_post},
         {.uri = "/auto",  .method = HTTP_GET,  .handler = h_auto_get},
         {.uri = "/reset", .method = HTTP_POST, .handler = h_reset_post},
+        {.uri = "/mqtt",  .method = HTTP_POST, .handler = h_mqtt_post},
     };
-    for (int i = 0; i < 4; i++) httpd_register_uri_handler(s_server, &routes[i]);
+    for (int i = 0; i < 5; i++) httpd_register_uri_handler(s_server, &routes[i]);
 
     ESP_LOGI(TAG, "Control server ready");
 }
@@ -459,5 +515,16 @@ void web_server_update_status(float moisture_pct, bool motor_on, bool motor_manu
     s_status.moisture_pct = moisture_pct;
     s_status.motor_on     = motor_on;
     s_status.motor_manual = motor_manual;
+    xSemaphoreGive(s_mutex);
+}
+
+void web_server_update_mqtt_status(bool connected, const char *url) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_status.mqtt_connected = connected;
+    if (url) {
+        strncpy(s_status.mqtt_url, url, sizeof(s_status.mqtt_url) - 1);
+        s_status.mqtt_url[sizeof(s_status.mqtt_url) - 1] = '\0';
+    }
     xSemaphoreGive(s_mutex);
 }
